@@ -1,0 +1,123 @@
+from flask import Flask, render_template, request, session
+from pathlib import Path
+from langchain_community.agent_toolkits.sql.base import create_sql_agent
+from langchain_community.utilities import SQLDatabase
+from langchain.agents.agent_types import AgentType
+from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
+from sqlalchemy import create_engine
+import sqlite3
+from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+import os
+import json
+from flask_session import Session
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Flask app
+app = Flask(__name__)
+app.secret_key = "your_secret_key"  # Replace with a secure secret key
+
+# Configure Flask-Session
+app.config["SESSION_TYPE"] = "filesystem"
+app.config["SESSION_PERMANENT"] = False
+Session(app)
+
+openai_api_key = os.environ.get("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError("OpenAI API key is required. Set it in the environment variables.")
+
+# Initialize LLM
+llm = ChatOpenAI(openai_api_key=openai_api_key, model_name="gpt-4o")
+
+# Default SQLite Path
+DEFAULT_SQLITE_PATH = str(Path("northwind.db").absolute())
+
+# Configure database connection
+def configure_db():
+    try:
+        dbfilepath = Path(DEFAULT_SQLITE_PATH).absolute()
+        if not dbfilepath.exists():
+            raise FileNotFoundError(f"SQLite database file '{dbfilepath}' does not exist.")
+        creator = lambda: sqlite3.connect(f"file:{dbfilepath}?mode=ro", uri=True)
+        return SQLDatabase(create_engine("sqlite:///", creator=creator))
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Chart generation prompt
+def generate_chart_prompt(response, chart_type):
+    return (
+        f"Using the following data: '{response}', create a Python Plotly {chart_type} chart that professionally visualizes "
+        "the insights. Ensure the chart is aesthetically pleasing, well-labeled, and optimized for clarity. The code "
+        "must be complete, executable, and include appropriate titles, axis labels, and legends. Avoid including any "
+        "extraneous formatting, markdown, or backticks—deliver only the clean Python code for the chart."
+    )
+
+# Execute Plotly code and convert to HTML
+def execute_plotly_code(chart_code):
+    try:
+        exec_globals = {}
+        exec(chart_code, exec_globals)
+        fig = exec_globals.get("fig")
+        if fig:
+            return fig.to_html(full_html=False)  # Return HTML representation
+    except Exception as e:
+        pass  # Ignore errors for simplicity
+    return None
+
+# Flask Routes
+@app.route("/", methods=["GET", "POST"])
+def index():
+    # Retrieve chat history from session
+    chat_history = session.get("chat_history", [])
+
+    user_query = None
+    new_entry = {"query": None, "response": None, "charts": []}
+
+    if request.method == "POST":
+        user_query = request.form.get("user_query")
+        new_entry["query"] = user_query
+
+        try:
+            # Configure the database
+            db = configure_db()
+            if isinstance(db, str):  # If db configuration returned an error
+                new_entry["response"] = db
+            else:
+                # Create SQL agent
+                toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+                agent = create_sql_agent(
+                    llm=llm,
+                    toolkit=toolkit,
+                    verbose=True,
+                    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+                    handle_parsing_errors=True,
+                )
+
+                # Invoke the query
+                response = agent.invoke({"input": user_query})["output"]
+                new_entry["response"] = response
+
+                # Generate charts
+                for chart_type in ["bar", "pie", "line"]:
+                    chart_prompt = generate_chart_prompt(response, chart_type)
+                    chart_code = llm.invoke(chart_prompt).content.strip()
+                    chart_html = execute_plotly_code(chart_code)
+                    if chart_html:
+                        new_entry["charts"].append(chart_html)
+
+        except Exception as e:
+            new_entry["response"] = f"An error occurred: {str(e)}"
+
+        chat_history.append(new_entry)
+        session["chat_history"] = chat_history  # Save chat history to session
+
+    return render_template(
+        "index_chat.html",
+        chat_history=chat_history,
+    )
+
+# Run the app
+if __name__ == "__main__":
+    app.run(debug=True)
